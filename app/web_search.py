@@ -4,8 +4,8 @@ import re
 import time
 from typing import Any
 
-from duckduckgo_search import DDGS
-from duckduckgo_search.exceptions import DuckDuckGoSearchException
+from ddgs import DDGS
+from ddgs.exceptions import DDGSException
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +74,12 @@ def web_search(query: str, max_results: int = DEFAULT_MAX_RESULTS) -> str:
 
     try:
         results = DDGS(timeout=SEARCH_TIMEOUT).text(
-            keywords=query,
+            query,
             region="wt-wt",
             safesearch="moderate",
             max_results=max_results,
         )
-    except DuckDuckGoSearchException as e:
+    except DDGSException as e:
         logger.warning("DuckDuckGo search failed: %s", e)
         return json.dumps({"error": f"検索に失敗しました: {e}"}, ensure_ascii=False)
     except Exception as e:
