@@ -61,6 +61,7 @@ class ChatWindow(QMainWindow):
         self.worker = ChatWorker(self.client, message)
         self.worker.response_ready.connect(self.on_response)
         self.worker.error_occurred.connect(self.on_error)
+        self.worker.status_update.connect(self.on_status_update)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
 
@@ -69,6 +70,10 @@ class ChatWindow(QMainWindow):
 
     def on_error(self, error: str):
         self.chat_display.append(f"[エラー] {error}\n")
+
+    def on_status_update(self, status: str):
+        self.send_button.setText(status)
+        self.chat_display.append(f"[{status}]")
 
     def on_finished(self):
         self.input_field.setEnabled(True)
