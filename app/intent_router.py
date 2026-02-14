@@ -31,6 +31,7 @@ ROUTER_SYSTEM_MESSAGE = {
         '"clarification_prompt":"2-3 choice Japanese question or empty string",'
         '"rewritten_user_message":"standalone user intent sentence or empty string",'
         '"use_rewrite":true,'
+        '"rewrite_confidence":0.0,'
         '"reset_context":false'
         "}\n"
         "No markdown. No extra keys."
@@ -81,6 +82,12 @@ class IntentRouter:
         clarification_prompt = str(data.get("clarification_prompt", "")).strip()
         rewritten = str(data.get("rewritten_user_message", "")).strip()
         use_rewrite = bool(data.get("use_rewrite", False))
+        rewrite_confidence_raw = data.get("rewrite_confidence", 0.0)
+        try:
+            rewrite_confidence = float(rewrite_confidence_raw)
+        except (TypeError, ValueError):
+            rewrite_confidence = 0.0
+        rewrite_confidence = min(1.0, max(0.0, rewrite_confidence))
         reset_context = bool(data.get("reset_context", False))
 
         if use_rewrite and not rewritten:
@@ -93,6 +100,7 @@ class IntentRouter:
             "clarification_prompt": clarification_prompt,
             "rewritten_user_message": rewritten,
             "use_rewrite": use_rewrite,
+            "rewrite_confidence": rewrite_confidence,
             "reset_context": reset_context,
         }
 
@@ -106,6 +114,7 @@ class IntentRouter:
             "clarification_prompt": "",
             "rewritten_user_message": "",
             "use_rewrite": False,
+            "rewrite_confidence": 0.0,
             "reset_context": False,
         }
 
