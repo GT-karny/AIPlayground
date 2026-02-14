@@ -48,5 +48,5 @@
 - Expect: 前話題を引きずらず、新話題として回答。
 
 ## Router: Reset Context
-- User: ?? what are you saying?
+- User: ?? 何言ってるの?
 - Expect: ルーターが文脈リセットを選び、前の誤文脈を継続しない。

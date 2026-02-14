@@ -155,6 +155,111 @@ class ChatClient:
             except json.JSONDecodeError:
                 return {}
 
+    @staticmethod
+    def _turn_sort_key(turn_id: str) -> int:
+        try:
+            return int(str(turn_id).split("-")[-1])
+        except Exception:
+            return 0
+
+    def _recent_turn_candidates(self) -> list[dict[str, str]]:
+        turns: dict[str, dict[str, str]] = {}
+        for row in self.messages:
+            role = row.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            turn_id = str(row.get("turn_id", "")).strip()
+            if not turn_id:
+                continue
+            content = (row.get("content", "") or "").strip().replace("\n", " ")
+            if not content:
+                continue
+            slot = turns.setdefault(turn_id, {"turn_id": turn_id, "user": "", "assistant": ""})
+            slot[role] = content[:280]
+
+        ordered = sorted(turns.values(), key=lambda x: self._turn_sort_key(x["turn_id"]))
+        if config.TOPIC_SELECTOR_MAX_TURNS <= 0:
+            return ordered
+        return ordered[-config.TOPIC_SELECTOR_MAX_TURNS :]
+
+    def _select_topic_context(self, user_message: str, rewritten_user_message: str) -> dict:
+        empty = {"topic_summary": "", "selected_turn_ids": [], "confidence": 0.0}
+        if not config.TOPIC_SELECTOR_ENABLED:
+            return empty
+
+        candidates = self._recent_turn_candidates()
+        if not candidates:
+            return empty
+
+        candidate_lines = []
+        id_to_turn: dict[str, dict[str, str]] = {}
+        for turn in candidates:
+            turn_id = turn.get("turn_id", "")
+            id_to_turn[turn_id] = turn
+            candidate_lines.append(
+                f'- {turn_id} | user="{turn.get("user", "")}" | assistant="{turn.get("assistant", "")}"'
+            )
+
+        prompt = (
+            "次のユーザー入力で、文脈参照が必要かを判定し、必要なら参照すべき直近話題を選んでください。\n"
+            "出力はJSONのみ:\n"
+            '{"use_context": true/false, "selected_turn_ids": ["turn-1"], "topic_summary": "20-60文字", "confidence": 0.0}\n'
+            "ルール:\n"
+            "1) 新話題なら use_context=false\n"
+            "2) 継続話題なら最小限の turn_id を選ぶ\n"
+            "3) topic_summary は検索クエリに使える名詞中心\n"
+            f"最新ユーザー入力: {user_message}\n"
+            f"文脈補完後入力: {rewritten_user_message}\n"
+            "候補ターン:\n"
+            f"{chr(10).join(candidate_lines)}"
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=config.ROUTER_MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=config.TOPIC_SELECTOR_MAX_TOKENS,
+                temperature=0.0,
+            )
+            message = self._extract_message(response)
+            parsed = self._extract_json_object(message.content or "")
+        except Exception as e:
+            logger.warning("Topic selector failed: %s", e)
+            parsed = {}
+
+        selected_ids: list[str] = []
+        raw_ids = parsed.get("selected_turn_ids", [])
+        if isinstance(raw_ids, list):
+            for item in raw_ids:
+                tid = str(item).strip()
+                if tid in id_to_turn and tid not in selected_ids:
+                    selected_ids.append(tid)
+
+        topic_summary = str(parsed.get("topic_summary", "")).strip()
+        use_context = bool(parsed.get("use_context", False))
+        try:
+            confidence = float(parsed.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = min(1.0, max(0.0, confidence))
+
+        if use_context and selected_ids and not topic_summary:
+            last = id_to_turn[selected_ids[-1]]
+            topic_summary = (last.get("user", "") or last.get("assistant", ""))[:60]
+
+        if not use_context or not selected_ids:
+            return empty
+
+        threshold = config.TOPIC_SELECTOR_CONFIDENCE_THRESHOLD
+        if confidence < threshold:
+            return empty
+
+        return {
+            "topic_summary": topic_summary,
+            "selected_turn_ids": selected_ids,
+            "confidence": confidence,
+        }
+
     def _collect_recent_search_results(self, turn_id: str | None = None) -> list[dict]:
         for row in reversed(self.messages):
             if row.get("role") != "tool" or row.get("name") != "web_search":
@@ -335,9 +440,12 @@ class ChatClient:
         self,
         user_message: str,
         rewritten_user_message: str,
+        topic_context_hint: str,
         issues: list[str],
     ) -> list[str]:
         base = rewritten_user_message.strip() or user_message.strip()
+        if topic_context_hint:
+            base = f"{topic_context_hint} {base}".strip()
         planning_prompt = (
             "ユーザー質問に再回答するための検索クエリを設計してください。\n"
             "出力はJSONのみ: {\"queries\":[\"...\",\"...\"]}\n"
@@ -347,6 +455,7 @@ class ChatClient:
             "3) 質問対象の正式名称を優先\n"
             f"元質問: {user_message}\n"
             f"文脈補完後質問: {rewritten_user_message}\n"
+            f"選択された話題ヒント: {topic_context_hint or 'none'}\n"
             f"検知issues: {','.join(issues) if issues else 'none'}"
         )
         fallback = [base, f"{base} 公式"]
@@ -421,6 +530,7 @@ class ChatClient:
         self,
         user_message: str,
         rewritten_user_message: str,
+        topic_context_hint: str,
         results: list[dict],
     ) -> str:
         if not results:
@@ -443,6 +553,7 @@ class ChatClient:
             "3) 最後に出典URLを最大3件列挙\n"
             f"元質問: {user_message}\n"
             f"文脈補完後質問: {rewritten_user_message}\n"
+            f"選択された話題ヒント: {topic_context_hint or 'none'}\n"
             f"検索結果JSON: {json.dumps(compact, ensure_ascii=False)}"
         )
         try:
@@ -479,6 +590,7 @@ class ChatClient:
         self,
         user_message: str,
         rewritten_user_message: str,
+        topic_context_hint: str,
         issues: list[str],
         turn_id: str,
     ) -> str:
@@ -491,6 +603,7 @@ class ChatClient:
         queries = self._plan_research_queries(
             user_message=user_message,
             rewritten_user_message=rewritten_user_message,
+            topic_context_hint=topic_context_hint,
             issues=issues,
         )
         results, payloads = self._run_research_queries(queries)
@@ -500,6 +613,7 @@ class ChatClient:
         return self._summarize_research_results(
             user_message=user_message,
             rewritten_user_message=rewritten_user_message,
+            topic_context_hint=topic_context_hint,
             results=results,
         )
 
@@ -559,8 +673,10 @@ class ChatClient:
         rewritten_user_message = (
             routed_rewrite if (use_rewrite and rewrite_confidence >= 0.6 and routed_rewrite) else user_message.strip()
         )
+        topic_context = self._select_topic_context(user_message, rewritten_user_message)
+        topic_context_hint = str(topic_context.get("topic_summary", "")).strip()
         logger.info(
-            "route mode=%s conf=%.2f reason=%s use_rewrite=%s rewrite_conf=%.2f reset=%s rewritten=%s",
+            "route mode=%s conf=%.2f reason=%s use_rewrite=%s rewrite_conf=%.2f reset=%s rewritten=%s topic_conf=%.2f topic_turns=%s topic_hint=%s",
             mode,
             confidence,
             reason,
@@ -568,10 +684,14 @@ class ChatClient:
             rewrite_confidence,
             reset_context,
             rewritten_user_message,
+            float(topic_context.get("confidence", 0.0)),
+            ",".join(topic_context.get("selected_turn_ids", [])),
+            topic_context_hint,
         )
 
         if reset_context:
             self.clear_history()
+            topic_context_hint = ""
 
         turn_id = self._next_turn_id()
 
@@ -591,6 +711,7 @@ class ChatClient:
             queries = self._plan_research_queries(
                 user_message=user_message,
                 rewritten_user_message=rewritten_user_message,
+                topic_context_hint=topic_context_hint,
                 issues=[],
             )
             if status_callback:
@@ -603,6 +724,7 @@ class ChatClient:
                 content = self._summarize_research_results(
                     user_message=user_message,
                     rewritten_user_message=rewritten_user_message,
+                    topic_context_hint=topic_context_hint,
                     results=results,
                 )
                 check = self._apply_self_check(
@@ -619,6 +741,7 @@ class ChatClient:
                     recovered = self._attempt_autonomous_research_recovery(
                         user_message=user_message,
                         rewritten_user_message=rewritten_user_message,
+                        topic_context_hint=topic_context_hint,
                         issues=check.get("issues", []),
                         turn_id=turn_id,
                     )
@@ -644,6 +767,13 @@ class ChatClient:
                         {
                             "role": "system",
                             "content": f"このターンの質問意図: {rewritten_user_message}",
+                        }
+                    )
+                if topic_context_hint:
+                    request_messages.append(
+                        {
+                            "role": "system",
+                            "content": f"このターンで参照する話題: {topic_context_hint}",
                         }
                     )
                 response = self.client.chat.completions.create(
@@ -677,6 +807,7 @@ class ChatClient:
                     recovered = self._attempt_autonomous_research_recovery(
                         user_message=user_message,
                         rewritten_user_message=rewritten_user_message,
+                        topic_context_hint=topic_context_hint,
                         issues=check.get("issues", []),
                         turn_id=turn_id,
                     )
