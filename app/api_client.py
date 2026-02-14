@@ -29,33 +29,71 @@ class ChatClient:
         )
         self.messages = [SYSTEM_MESSAGE]
 
-    def send_message(self, user_message: str) -> str:
-        self.messages.append({"role": "user", "content": user_message})
+    @staticmethod
+    def _extract_message(response):
+        error = getattr(response, "error", None)
+        if error:
+            if isinstance(error, dict):
+                msg = error.get("message", str(error))
+            else:
+                msg = str(error)
+            raise RuntimeError(f"LLM API error: {msg}")
 
+        choices = getattr(response, "choices", None)
+        if not choices:
+            raise RuntimeError("LLM API returned no choices.")
+
+        return choices[0].message
+
+    @staticmethod
+    def _is_tooling_error(error_message: str) -> bool:
+        msg = error_message.lower()
+        keywords = [
+            "tool",
+            "toolparser",
+            "tool-call-parser",
+            "tool choice",
+            "tools",
+        ]
+        return any(k in msg for k in keywords)
+
+    def _generate_without_tools(self) -> str:
         response = self.client.chat.completions.create(
             model=config.MODEL_NAME,
             messages=self.messages,
             max_tokens=config.MAX_TOKENS,
             temperature=config.TEMPERATURE,
         )
+        message = self._extract_message(response)
+        content = message.content or ""
+        self.messages.append({"role": "assistant", "content": content})
+        return content
 
-        assistant_message = response.choices[0].message.content
-        self.messages.append({"role": "assistant", "content": assistant_message})
-        return assistant_message
+    def send_message(self, user_message: str) -> str:
+        self.messages.append({"role": "user", "content": user_message})
+        return self._generate_without_tools()
 
     def send_message_with_tools(self, user_message: str, status_callback=None) -> str:
         self.messages.append({"role": "user", "content": user_message})
 
         for _ in range(MAX_TOOL_ITERATIONS):
-            response = self.client.chat.completions.create(
-                model=config.MODEL_NAME,
-                messages=self.messages,
-                max_tokens=config.MAX_TOKENS,
-                temperature=config.TEMPERATURE,
-                tools=TOOLS,
-            )
-
-            message = response.choices[0].message
+            try:
+                response = self.client.chat.completions.create(
+                    model=config.MODEL_NAME,
+                    messages=self.messages,
+                    max_tokens=config.MAX_TOKENS,
+                    temperature=config.TEMPERATURE,
+                    tools=TOOLS,
+                )
+                message = self._extract_message(response)
+            except RuntimeError as e:
+                error_text = str(e)
+                logger.warning("Tool-enabled request failed: %s", error_text)
+                if self._is_tooling_error(error_text):
+                    if status_callback:
+                        status_callback("ツール未対応のため通常応答に切替")
+                    return self._generate_without_tools()
+                raise
 
             if not message.tool_calls:
                 content = message.content or ""
