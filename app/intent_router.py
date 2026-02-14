@@ -19,21 +19,19 @@ ALLOWED_MODES = {
 ROUTER_SYSTEM_MESSAGE = {
     "role": "system",
     "content": (
-        "You are an intent router for a Japanese assistant.\n"
-        "Classify the latest user message using recent conversation context.\n"
-        "Modes:\n"
-        "- chat\n"
-        "- factual_balanced\n"
-        "- factual_strict\n"
-        "- needs_clarification\n"
-        "If the latest message is short or elliptical (e.g. 主人公誰？), resolve it with context.\n"
-        "Return ONLY valid JSON in this schema:\n"
+        "You are an intent router for a multilingual chat assistant.\n"
+        "Decide user intent from recent context, but do not overfit to previous topic.\n"
+        "If the latest message indicates topic shift or user confusion, set reset_context=true.\n"
+        "If context rewrite is useful, set use_rewrite=true and provide rewritten_user_message.\n"
+        "Return ONLY valid JSON in this exact schema:\n"
         "{"
         '"mode":"chat|factual_balanced|factual_strict|needs_clarification",'
         '"confidence":0.0,'
         '"reason":"short Japanese reason",'
         '"clarification_prompt":"2-3 choice Japanese question or empty string",'
-        '"rewritten_user_message":"standalone Japanese user intent sentence"'
+        '"rewritten_user_message":"standalone user intent sentence or empty string",'
+        '"use_rewrite":true,'
+        '"reset_context":false'
         "}\n"
         "No markdown. No extra keys."
     ),
@@ -57,7 +55,6 @@ class IntentRouter:
         raw = (text or "").strip()
         if not raw:
             raise ValueError("empty router response")
-
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -82,7 +79,12 @@ class IntentRouter:
 
         reason = str(data.get("reason", "")).strip()
         clarification_prompt = str(data.get("clarification_prompt", "")).strip()
-        rewritten = str(data.get("rewritten_user_message", "")).strip() or user_message.strip()
+        rewritten = str(data.get("rewritten_user_message", "")).strip()
+        use_rewrite = bool(data.get("use_rewrite", False))
+        reset_context = bool(data.get("reset_context", False))
+
+        if use_rewrite and not rewritten:
+            rewritten = user_message.strip()
 
         return {
             "mode": mode,
@@ -90,56 +92,34 @@ class IntentRouter:
             "reason": reason,
             "clarification_prompt": clarification_prompt,
             "rewritten_user_message": rewritten,
+            "use_rewrite": use_rewrite,
+            "reset_context": reset_context,
         }
 
     @staticmethod
     def _fallback(user_message: str) -> dict[str, Any]:
         text = (user_message or "").strip()
-        if not text:
-            return {
-                "mode": "needs_clarification",
-                "confidence": 0.4,
-                "reason": "入力が空",
-                "clarification_prompt": (
-                    "もう少し詳しく教えてください。どう進めますか？\n"
-                    "1. 要点だけ知りたい\n"
-                    "2. 背景から詳しく知りたい\n"
-                    "3. まず何を決めるべきか知りたい"
-                ),
-                "rewritten_user_message": "",
-            }
-        if len(text) <= 4:
-            return {
-                "mode": "needs_clarification",
-                "confidence": 0.45,
-                "reason": "入力が短すぎる",
-                "clarification_prompt": (
-                    "意図を確認したいです。どの形で進めますか？\n"
-                    "1. 質問内容を具体化する\n"
-                    "2. こちらで候補を出して選ぶ\n"
-                    "3. まず概要だけ聞く"
-                ),
-                "rewritten_user_message": text,
-            }
         return {
-            "mode": "factual_balanced",
-            "confidence": 0.35,
-            "reason": "ルーター失敗時の既定",
+            "mode": "factual_balanced" if text else "needs_clarification",
+            "confidence": 0.2,
+            "reason": "router_fallback",
             "clarification_prompt": "",
-            "rewritten_user_message": text,
+            "rewritten_user_message": "",
+            "use_rewrite": False,
+            "reset_context": False,
         }
 
     @staticmethod
     def _build_router_context(history: list[dict[str, str]], user_message: str) -> str:
         lines = []
-        for row in history[-6:]:
+        for row in history[-8:]:
             role = row.get("role", "")
             if role not in ("user", "assistant"):
                 continue
             content = (row.get("content", "") or "").strip().replace("\n", " ")
             if not content:
                 continue
-            lines.append(f"{role}: {content[:220]}")
+            lines.append(f"{role}: {content[:240]}")
         lines.append(f"user: {(user_message or '').strip()}")
         return "\n".join(lines)
 

@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 from openai import OpenAI
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ITERATIONS = 3
 URL_PATTERN = re.compile(r"https?://[^\s)>\"]+")
 REPEAT_BLOCK_PATTERN = re.compile(r"(.{8,40})\1{2,}", re.DOTALL)
+VALID_ISSUES = {"factual_error", "context_miss", "non_answer", "repetition"}
 
 CHAT_SYSTEM_MESSAGE = {
     "role": "system",
@@ -137,12 +139,40 @@ class ChatClient:
     def _response_max_tokens(factual_mode: bool) -> int:
         return config.FACTUAL_MAX_TOKENS if factual_mode else config.CHAT_MAX_TOKENS
 
+    @staticmethod
+    def _extract_json_object(raw: str) -> dict:
+        text = (raw or "").strip()
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start < 0 or end <= start:
+                return {}
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                return {}
+
+    def _collect_recent_search_results(self) -> list[dict]:
+        for row in reversed(self.messages):
+            if row.get("role") != "tool" or row.get("name") != "web_search":
+                continue
+            payload = self._extract_json_object(row.get("content", "{}"))
+            results = payload.get("results", [])
+            if isinstance(results, list):
+                return results[:5]
+        return []
+
     def _repair_output(
         self,
         broken_output: str,
         user_message: str,
         rewritten_user_message: str,
         factual_mode: bool,
+        repair_instruction: str = "",
     ) -> str:
         repair_prompt = (
             "次の回答文を、意味をなるべく保ったまま再構成してください。\n"
@@ -155,9 +185,10 @@ class ChatClient:
             f"ユーザー入力: {user_message}\n"
             f"文脈補完後: {rewritten_user_message}\n"
             f"事実寄りモード: {'yes' if factual_mode else 'no'}\n"
-            "修正対象:\n"
-            f"{broken_output}"
         )
+        if repair_instruction:
+            repair_prompt += f"追加修正指示: {repair_instruction}\n"
+        repair_prompt += f"修正対象:\n{broken_output}"
         try:
             response = self.client.chat.completions.create(
                 model=config.MODEL_NAME,
@@ -171,35 +202,289 @@ class ChatClient:
             logger.warning("Output repair failed: %s", e)
             return broken_output
 
-    def _postprocess_output(
+    def _validate_answer(
+        self,
+        user_message: str,
+        rewritten_user_message: str,
+        answer: str,
+        factual_mode: bool,
+    ) -> dict:
+        if not config.ENABLE_SELF_CHECK:
+            return {"ok": True, "issues": [], "repair_instruction": ""}
+
+        heuristic_issues: list[str] = []
+        if self._is_broken_output(answer):
+            heuristic_issues.append("repetition")
+
+        search_results = self._collect_recent_search_results() if factual_mode else []
+        validation_prompt = (
+            "あなたは回答品質チェッカーです。次の回答を検証してください。\n"
+            "出力はJSONのみ:\n"
+            '{"ok": true/false, "issues": ["factual_error|context_miss|non_answer|repetition"], "repair_instruction": "短い修正指示"}\n'
+            "チェック基準:\n"
+            "1) 質問に直接答えているか\n"
+            "2) 文脈補完後の意図に整合しているか\n"
+            "3) 事実誤りや矛盾が目立たないか\n"
+            "4) 不自然な反復がないか\n"
+            f"元の質問: {user_message}\n"
+            f"文脈補完後: {rewritten_user_message}\n"
+            f"回答:\n{answer}\n"
+            f"事実寄りモード: {'yes' if factual_mode else 'no'}\n"
+            f"検索結果(要約JSON): {json.dumps(search_results, ensure_ascii=False)}\n"
+            f"既知の機械検知issues: {','.join(heuristic_issues) if heuristic_issues else 'none'}"
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=config.MODEL_NAME,
+                messages=[{"role": "user", "content": validation_prompt}],
+                max_tokens=config.SELF_CHECK_MAX_TOKENS,
+                temperature=0.0,
+            )
+            message = self._extract_message(response)
+            parsed = self._extract_json_object(message.content or "")
+        except Exception as e:
+            logger.warning("Self-check call failed: %s", e)
+            return {"ok": False, "issues": ["non_answer"], "repair_instruction": "短く正確に答える"}
+
+        if not parsed:
+            return {"ok": False, "issues": ["non_answer"], "repair_instruction": "要点だけ答える"}
+
+        ok = bool(parsed.get("ok", False))
+        issues_raw = parsed.get("issues", [])
+        issues: list[str] = []
+        if isinstance(issues_raw, list):
+            for item in issues_raw:
+                key = str(item).strip()
+                if key in VALID_ISSUES and key not in issues:
+                    issues.append(key)
+        if heuristic_issues:
+            for item in heuristic_issues:
+                if item not in issues:
+                    issues.append(item)
+            ok = False
+
+        repair_instruction = str(parsed.get("repair_instruction", "")).strip()
+        if not repair_instruction and not ok:
+            repair_instruction = "質問に直接答え、誤りと反復をなくして短く言い直す"
+
+        return {"ok": ok, "issues": issues, "repair_instruction": repair_instruction}
+
+    def _apply_self_check(
         self,
         content: str,
         user_message: str,
         rewritten_user_message: str,
         factual_mode: bool,
-    ) -> str:
-        if not self._is_broken_output(content):
-            return content
-        repaired = self._repair_output(
-            broken_output=content,
+    ) -> dict:
+        current = content
+        attempts = max(0, config.SELF_CHECK_MAX_RETRY)
+        validation = self._validate_answer(
             user_message=user_message,
             rewritten_user_message=rewritten_user_message,
+            answer=current,
             factual_mode=factual_mode,
         )
-        if not self._is_broken_output(repaired):
-            return repaired
-        return "回答が不安定だったため、短く言い直します。対象を1つに絞って聞いてください。"
+        logger.info("self-check ok=%s issues=%s", validation["ok"], validation["issues"])
+        if validation["ok"]:
+            return {"ok": True, "content": current, "issues": []}
+
+        for _ in range(attempts):
+            current = self._repair_output(
+                broken_output=current,
+                user_message=user_message,
+                rewritten_user_message=rewritten_user_message,
+                factual_mode=factual_mode,
+                repair_instruction=validation.get("repair_instruction", ""),
+            )
+            validation = self._validate_answer(
+                user_message=user_message,
+                rewritten_user_message=rewritten_user_message,
+                answer=current,
+                factual_mode=factual_mode,
+            )
+            logger.info("self-check retry ok=%s issues=%s", validation["ok"], validation["issues"])
+            if validation["ok"]:
+                return {"ok": True, "content": current, "issues": []}
+
+        return {
+            "ok": False,
+            "content": current,
+            "issues": validation.get("issues", []),
+            "repair_instruction": validation.get("repair_instruction", ""),
+        }
+
+    def _plan_research_queries(
+        self,
+        user_message: str,
+        rewritten_user_message: str,
+        issues: list[str],
+    ) -> list[str]:
+        planning_prompt = (
+            "ユーザー質問に再回答するための再検索クエリを設計してください。\n"
+            "出力はJSONのみ: {\"queries\":[\"...\",\"...\"]}\n"
+            "条件:\n"
+            "1) 日本語中心で1〜3件\n"
+            "2) 固有名詞が曖昧なら正式名称を含める\n"
+            "3) 1件は公式/一次情報寄りクエリを含める\n"
+            f"元質問: {user_message}\n"
+            f"文脈補完後質問: {rewritten_user_message}\n"
+            f"検知issues: {','.join(issues) if issues else 'none'}"
+        )
+        fallback = [rewritten_user_message, f"{rewritten_user_message} 公式"]
+        try:
+            response = self.client.chat.completions.create(
+                model=config.MODEL_NAME,
+                messages=[{"role": "user", "content": planning_prompt}],
+                max_tokens=160,
+                temperature=0.0,
+            )
+            message = self._extract_message(response)
+            payload = self._extract_json_object(message.content or "")
+            raw_queries = payload.get("queries", [])
+            if not isinstance(raw_queries, list):
+                return fallback[: config.AUTO_RESEARCH_MAX_QUERIES]
+            queries: list[str] = []
+            for item in raw_queries:
+                q = str(item).strip()
+                if not q or q in queries:
+                    continue
+                queries.append(q)
+                if len(queries) >= config.AUTO_RESEARCH_MAX_QUERIES:
+                    break
+            if queries:
+                return queries
+        except Exception as e:
+            logger.warning("Research query planning failed: %s", e)
+        return fallback[: config.AUTO_RESEARCH_MAX_QUERIES]
+
+    def _run_research_queries(self, queries: list[str]) -> list[dict]:
+        gathered: list[dict] = []
+        for i, query in enumerate(queries):
+            if i > 0:
+                time.sleep(0.55)
+            try:
+                result_text = execute_tool_call(
+                    "web_search",
+                    {
+                        "query": query,
+                        "max_results": max(1, min(config.AUTO_RESEARCH_MAX_RESULTS, 8)),
+                    },
+                )
+            except Exception as e:
+                logger.warning("Autonomous re-search call failed: %s", e)
+                continue
+            payload = self._extract_json_object(result_text)
+            results = payload.get("results", [])
+            if not isinstance(results, list):
+                continue
+            for row in results:
+                if isinstance(row, dict):
+                    row = dict(row)
+                    row["_research_query"] = query
+                    gathered.append(row)
+        deduped: list[dict] = []
+        seen_urls: set[str] = set()
+        for row in gathered:
+            url = str(row.get("url", "")).strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            deduped.append(row)
+            if len(deduped) >= config.AUTO_RESEARCH_MAX_RESULTS * config.AUTO_RESEARCH_MAX_QUERIES:
+                break
+        return deduped
+
+    def _summarize_research_results(
+        self,
+        user_message: str,
+        rewritten_user_message: str,
+        results: list[dict],
+    ) -> str:
+        if not results:
+            return ""
+        compact = []
+        for row in results[:8]:
+            compact.append(
+                {
+                    "title": row.get("title", ""),
+                    "snippet": row.get("snippet", ""),
+                    "url": row.get("url", ""),
+                    "query": row.get("_research_query", ""),
+                }
+            )
+        summary_prompt = (
+            "次の検索結果をもとに、ユーザー質問へ短く正確に回答してください。\n"
+            "要件:\n"
+            "1) 最初の1文で質問に直接答える\n"
+            "2) 不確かな場合は断定しない\n"
+            "3) 最後に出典URLを最大3件列挙\n"
+            f"元質問: {user_message}\n"
+            f"文脈補完後質問: {rewritten_user_message}\n"
+            f"検索結果JSON: {json.dumps(compact, ensure_ascii=False)}"
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model=config.MODEL_NAME,
+                messages=[{"role": "user", "content": summary_prompt}],
+                max_tokens=min(480, config.FACTUAL_MAX_TOKENS),
+                temperature=0.1,
+            )
+            message = self._extract_message(response)
+            text = (message.content or "").strip()
+            if text:
+                return text
+        except Exception as e:
+            logger.warning("Research summary generation failed: %s", e)
+
+        lines = []
+        top = results[0]
+        snippet = str(top.get("snippet", "")).strip() or str(top.get("title", "")).strip()
+        lines.append(snippet if snippet else "再検索結果から回答をまとめました。")
+        lines.append("出典:")
+        used = 0
+        for row in results:
+            url = str(row.get("url", "")).strip()
+            if not url:
+                continue
+            lines.append(f"- {url}")
+            used += 1
+            if used >= 3:
+                break
+        return "\n".join(lines)
+
+    def _attempt_autonomous_research_recovery(
+        self,
+        user_message: str,
+        rewritten_user_message: str,
+        issues: list[str],
+    ) -> str:
+        if not config.AUTO_RESEARCH_ENABLED:
+            return ""
+        trigger = {"factual_error", "context_miss", "non_answer", "repetition"}
+        if not any(issue in trigger for issue in issues):
+            return ""
+
+        queries = self._plan_research_queries(
+            user_message=user_message,
+            rewritten_user_message=rewritten_user_message,
+            issues=issues,
+        )
+        results = self._run_research_queries(queries)
+        if not results:
+            return ""
+        return self._summarize_research_results(
+            user_message=user_message,
+            rewritten_user_message=rewritten_user_message,
+            results=results,
+        )
 
     def _build_cited_fallback_from_tools(self) -> Optional[str]:
         for message in reversed(self.messages):
             if message.get("role") != "tool" or message.get("name") != "web_search":
                 continue
 
-            try:
-                payload = json.loads(message.get("content", "{}"))
-            except json.JSONDecodeError:
-                continue
-
+            payload = self._extract_json_object(message.get("content", "{}"))
             results = payload.get("results", [])
             if not isinstance(results, list) or not results:
                 continue
@@ -255,16 +540,22 @@ class ChatClient:
         mode = route.get("mode", "factual_balanced")
         confidence = float(route.get("confidence", 0.0))
         reason = route.get("reason", "")
-        rewritten_user_message = (
-            route.get("rewritten_user_message", "").strip() or user_message.strip()
-        )
+        use_rewrite = bool(route.get("use_rewrite", False))
+        reset_context = bool(route.get("reset_context", False))
+        routed_rewrite = route.get("rewritten_user_message", "").strip()
+        rewritten_user_message = routed_rewrite if (use_rewrite and routed_rewrite) else user_message.strip()
         logger.info(
-            "Intent route mode=%s confidence=%.2f reason=%s rewritten=%s",
+            "Intent route mode=%s confidence=%.2f reason=%s use_rewrite=%s reset_context=%s rewritten=%s",
             mode,
             confidence,
             reason,
+            use_rewrite,
+            reset_context,
             rewritten_user_message,
         )
+
+        if reset_context:
+            self.clear_history()
 
         if mode == "needs_clarification":
             self.messages.append({"role": "user", "content": user_message})
@@ -313,12 +604,26 @@ class ChatClient:
                 if status_callback:
                     status_callback("回答作成中...")
 
-                content = self._postprocess_output(
-                    content=message.content or "",
+                content = (message.content or "").strip()
+                check = self._apply_self_check(
+                    content=content,
                     user_message=user_message,
                     rewritten_user_message=rewritten_user_message,
                     factual_mode=factual_mode,
                 )
+                content = check["content"]
+                if factual_mode and not check["ok"]:
+                    if status_callback:
+                        status_callback("再検索して再回答中...")
+                    recovered = self._attempt_autonomous_research_recovery(
+                        user_message=user_message,
+                        rewritten_user_message=rewritten_user_message,
+                        issues=check.get("issues", []),
+                    )
+                    if recovered:
+                        content = recovered
+                    elif not content:
+                        content = "回答の確度が十分でないため、対象を絞ってもう一度聞いてください。"
                 last_content = content
                 if strict_factual_mode and not self._has_citation(content):
                     tool_fallback = self._build_cited_fallback_from_tools()

@@ -13,3 +13,19 @@ FACTUAL_MAX_TOKENS = int(os.getenv("FACTUAL_MAX_TOKENS", "700"))
 ROUTER_MODEL_NAME = os.getenv("ROUTER_MODEL_NAME", MODEL_NAME)
 ROUTER_MAX_TOKENS = int(os.getenv("ROUTER_MAX_TOKENS", "220"))
 ROUTER_TEMPERATURE = float(os.getenv("ROUTER_TEMPERATURE", "0.0"))
+ENABLE_SELF_CHECK = os.getenv("ENABLE_SELF_CHECK", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+SELF_CHECK_MAX_RETRY = int(os.getenv("SELF_CHECK_MAX_RETRY", "1"))
+SELF_CHECK_MAX_TOKENS = int(os.getenv("SELF_CHECK_MAX_TOKENS", "320"))
+AUTO_RESEARCH_ENABLED = os.getenv("AUTO_RESEARCH_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+AUTO_RESEARCH_MAX_QUERIES = int(os.getenv("AUTO_RESEARCH_MAX_QUERIES", "3"))
+AUTO_RESEARCH_MAX_RESULTS = int(os.getenv("AUTO_RESEARCH_MAX_RESULTS", "4"))
