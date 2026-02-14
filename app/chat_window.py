@@ -18,6 +18,7 @@ class ChatWindow(QMainWindow):
         super().__init__()
         self.client = ChatClient()
         self.worker = None
+        self.last_status = ""
 
         self.setWindowTitle("AIチャット")
         self.setMinimumSize(600, 400)
@@ -73,10 +74,13 @@ class ChatWindow(QMainWindow):
 
     def on_status_update(self, status: str):
         self.send_button.setText(status)
-        self.chat_display.append(f"[{status}]")
+        if status != self.last_status:
+            self.chat_display.append(f"[{status}]")
+            self.last_status = status
 
     def on_finished(self):
         self.input_field.setEnabled(True)
         self.send_button.setEnabled(True)
         self.send_button.setText("送信")
         self.input_field.setFocus()
+        self.last_status = ""
