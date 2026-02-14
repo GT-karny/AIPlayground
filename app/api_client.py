@@ -6,44 +6,14 @@ from typing import Optional
 from openai import OpenAI
 
 from app import config
+from app.intent_router import IntentRouter
 from app.web_search import TOOLS, execute_tool_call
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 3
 URL_PATTERN = re.compile(r"https?://[^\s)>\"]+")
-
-FACTUAL_KEYWORDS = (
-    "何",
-    "なに",
-    "とは",
-    "誰",
-    "どこ",
-    "いつ",
-    "教えて",
-    "正確",
-    "根拠",
-    "出典",
-    "最新",
-    "公式",
-    "?",
-    "？",
-)
-
-STRICT_FACTUAL_KEYWORDS = (
-    "最新",
-    "今日",
-    "現在",
-    "公式",
-    "根拠",
-    "出典",
-    "統計",
-    "データ",
-    "価格",
-    "料金",
-    "日付",
-    "いつ",
-)
+REPEAT_BLOCK_PATTERN = re.compile(r"(.{8,40})\1{2,}", re.DOTALL)
 
 CHAT_SYSTEM_MESSAGE = {
     "role": "system",
@@ -75,10 +45,12 @@ BALANCED_FACTUAL_MODE_SYSTEM_MESSAGE = {
     ),
 }
 
-DEICTIC_PATTERN = re.compile(r"^(これ|それ|あれ|これについて|それについて|あれについて)")
-
-RECOMMEND_KEYWORDS = ("おすすめ", "比較", "選び方", "探して", "提案", "どれがいい")
-CONSTRAINT_HINTS = ("予算", "用途", "目的", "価格", "性能", "サイズ", "期間", "地域")
+DEFAULT_CLARIFYING_QUESTION = (
+    "確認させてください。どの形で進めますか？\n"
+    "1. ざっくり要点だけ\n"
+    "2. 具体例つきで詳しく\n"
+    "3. 先に前提条件を整理してから"
+)
 
 
 class ChatClient:
@@ -87,6 +59,7 @@ class ChatClient:
             base_url=config.BASE_URL,
             api_key=config.API_KEY,
         )
+        self.router = IntentRouter(self.client)
         self.messages = [CHAT_SYSTEM_MESSAGE]
 
     @staticmethod
@@ -122,16 +95,100 @@ class ChatClient:
         return any(k in msg for k in keywords)
 
     @staticmethod
-    def _is_factual_query(user_message: str) -> bool:
-        return any(k in user_message for k in FACTUAL_KEYWORDS)
-
-    @staticmethod
-    def _is_strict_factual_query(user_message: str) -> bool:
-        return any(k in user_message for k in STRICT_FACTUAL_KEYWORDS)
-
-    @staticmethod
     def _has_citation(text: str) -> bool:
         return bool(URL_PATTERN.search(text or ""))
+
+    @staticmethod
+    def _recent_dialogue_for_router(messages: list[dict]) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for row in messages:
+            role = row.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            content = (row.get("content", "") or "").strip()
+            if not content:
+                continue
+            rows.append({"role": role, "content": content})
+        return rows[-8:]
+
+    @staticmethod
+    def _is_broken_output(text: str) -> bool:
+        raw = (text or "").strip()
+        if not raw:
+            return True
+        if len(raw) > 1800:
+            return True
+        if REPEAT_BLOCK_PATTERN.search(raw):
+            return True
+
+        sentences = [s.strip() for s in re.split(r"[。！？\n]+", raw) if s.strip()]
+        if not sentences:
+            return True
+        freq: dict[str, int] = {}
+        for sentence in sentences:
+            if len(sentence) < 6:
+                continue
+            freq[sentence] = freq.get(sentence, 0) + 1
+            if freq[sentence] >= 4:
+                return True
+        return False
+
+    @staticmethod
+    def _response_max_tokens(factual_mode: bool) -> int:
+        return config.FACTUAL_MAX_TOKENS if factual_mode else config.CHAT_MAX_TOKENS
+
+    def _repair_output(
+        self,
+        broken_output: str,
+        user_message: str,
+        rewritten_user_message: str,
+        factual_mode: bool,
+    ) -> str:
+        repair_prompt = (
+            "次の回答文を、意味をなるべく保ったまま再構成してください。\n"
+            "制約:\n"
+            "1) 同じ内容の反復をしない\n"
+            "2) 4〜7文に収める\n"
+            "3) 断定しすぎない\n"
+            "4) 日本語で自然な会話調にする\n"
+            "5) 余計な前置きはしない\n"
+            f"ユーザー入力: {user_message}\n"
+            f"文脈補完後: {rewritten_user_message}\n"
+            f"事実寄りモード: {'yes' if factual_mode else 'no'}\n"
+            "修正対象:\n"
+            f"{broken_output}"
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model=config.MODEL_NAME,
+                messages=[{"role": "user", "content": repair_prompt}],
+                max_tokens=min(420, self._response_max_tokens(factual_mode)),
+                temperature=0.1,
+            )
+            message = self._extract_message(response)
+            return (message.content or "").strip()
+        except Exception as e:
+            logger.warning("Output repair failed: %s", e)
+            return broken_output
+
+    def _postprocess_output(
+        self,
+        content: str,
+        user_message: str,
+        rewritten_user_message: str,
+        factual_mode: bool,
+    ) -> str:
+        if not self._is_broken_output(content):
+            return content
+        repaired = self._repair_output(
+            broken_output=content,
+            user_message=user_message,
+            rewritten_user_message=rewritten_user_message,
+            factual_mode=factual_mode,
+        )
+        if not self._is_broken_output(repaired):
+            return repaired
+        return "回答が不安定だったため、短く言い直します。対象を1つに絞って聞いてください。"
 
     def _build_cited_fallback_from_tools(self) -> Optional[str]:
         for message in reversed(self.messages):
@@ -173,49 +230,11 @@ class ChatClient:
 
         return None
 
-    @staticmethod
-    def _needs_clarification(user_message: str) -> Optional[str]:
-        text = (user_message or "").strip()
-        if not text:
-            return "generic"
-        if len(text) <= 6:
-            return "generic"
-        if DEICTIC_PATTERN.search(text):
-            return "target"
-        if any(k in text for k in RECOMMEND_KEYWORDS) and not any(
-            k in text for k in CONSTRAINT_HINTS
-        ):
-            return "recommend"
-        return None
-
-    @staticmethod
-    def _build_clarifying_question(kind: str) -> str:
-        if kind == "target":
-            return (
-                "対象を確認したいです。どれについて話しますか？\n"
-                "1. いまの話題の具体名を指定する\n"
-                "2. 関連する候補をこちらで挙げて選ぶ\n"
-                "3. まず概要だけ知りたい"
-            )
-        if kind == "recommend":
-            return (
-                "どの軸を重視して探しますか？\n"
-                "1. 価格重視\n"
-                "2. 性能重視\n"
-                "3. バランス重視"
-            )
-        return (
-            "確認させてください。どの形で進めますか？\n"
-            "1. ざっくり要点だけ\n"
-            "2. 具体例つきで詳しく\n"
-            "3. 先に前提条件を整理してから"
-        )
-
-    def _generate_without_tools(self) -> str:
+    def _generate_without_tools(self, factual_mode: bool = False) -> str:
         response = self.client.chat.completions.create(
             model=config.MODEL_NAME,
             messages=self.messages,
-            max_tokens=config.MAX_TOKENS,
+            max_tokens=self._response_max_tokens(factual_mode),
             temperature=config.TEMPERATURE,
         )
         message = self._extract_message(response)
@@ -231,16 +250,31 @@ class ChatClient:
         if status_callback:
             status_callback("確認中...")
 
-        clarification_kind = self._needs_clarification(user_message)
-        if clarification_kind is not None:
+        history_for_router = self._recent_dialogue_for_router(self.messages)
+        route = self.router.classify(user_message, history_for_router)
+        mode = route.get("mode", "factual_balanced")
+        confidence = float(route.get("confidence", 0.0))
+        reason = route.get("reason", "")
+        rewritten_user_message = (
+            route.get("rewritten_user_message", "").strip() or user_message.strip()
+        )
+        logger.info(
+            "Intent route mode=%s confidence=%.2f reason=%s rewritten=%s",
+            mode,
+            confidence,
+            reason,
+            rewritten_user_message,
+        )
+
+        if mode == "needs_clarification":
             self.messages.append({"role": "user", "content": user_message})
-            clarifying = self._build_clarifying_question(clarification_kind)
+            clarifying = route.get("clarification_prompt") or DEFAULT_CLARIFYING_QUESTION
             self.messages.append({"role": "assistant", "content": clarifying})
             return clarifying
 
-        factual_mode = self._is_factual_query(user_message)
-        strict_factual_mode = factual_mode and self._is_strict_factual_query(user_message)
-        self.messages.append({"role": "user", "content": user_message})
+        factual_mode = mode in ("factual_balanced", "factual_strict")
+        strict_factual_mode = mode == "factual_strict"
+        self.messages.append({"role": "user", "content": rewritten_user_message})
         last_content = ""
 
         for _ in range(MAX_TOOL_ITERATIONS):
@@ -253,7 +287,7 @@ class ChatClient:
                 request_payload = dict(
                     model=config.MODEL_NAME,
                     messages=request_messages,
-                    max_tokens=config.MAX_TOKENS,
+                    max_tokens=self._response_max_tokens(factual_mode),
                     temperature=config.TEMPERATURE,
                     tools=TOOLS,
                 )
@@ -272,14 +306,19 @@ class ChatClient:
                         return safe_reply
                     if status_callback:
                         status_callback("ツール未対応のため通常応答に切替")
-                    return self._generate_without_tools()
+                    return self._generate_without_tools(factual_mode=factual_mode)
                 raise
 
             if not message.tool_calls:
                 if status_callback:
                     status_callback("回答作成中...")
 
-                content = message.content or ""
+                content = self._postprocess_output(
+                    content=message.content or "",
+                    user_message=user_message,
+                    rewritten_user_message=rewritten_user_message,
+                    factual_mode=factual_mode,
+                )
                 last_content = content
                 if strict_factual_mode and not self._has_citation(content):
                     tool_fallback = self._build_cited_fallback_from_tools()
